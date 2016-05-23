@@ -3,11 +3,37 @@ module AwsCommon
   require 'zip'
 
   METADATA_ENDPOINT = 'http://169.254.169.254/latest/meta-data/'
-  PLATFORMS = {'RunInstances:000g' => 'SUSE Linux', 'RunInstances:0006' => 'Windows with SQL Server Standard', 'RunInstances:0202' => 'Windows with SQL Server Web', 'RunInstances:0010' => 'Red Hat Enterprise Linux', 'RunInstances:0102' => 'Windows with SQL Server Enterprise'}
+
+  PLATFORMS = {
+    'RunInstances:000g' => 'SUSE Linux',
+    'RunInstances:0006' => 'Windows with SQL Server Standard',
+    'RunInstances:0202' => 'Windows with SQL Server Web',
+    'RunInstances:0010' => 'Red Hat Enterprise Linux',
+    'RunInstances:0102' => 'Windows with SQL Server Enterprise'
+  }
+
+  FACTORS = {
+    "nano"     => 0.25,
+    "micro"    => 0.5,
+    "small"    => 1,
+    "medium"   => 2,
+    "large"    => 4,
+    "xlarge"   => 8,
+    "2xlarge"  => 16,
+    "4xlarge"  => 32,
+    "8xlarge"  => 64,
+    "10xlarge" => 80
+  }
+  FACTORS.default = 0
+
+  def get_factor(type)
+    size = type.split(".")[1]
+    return (FACTORS[size])
+  end
 
   def get_current_account_id
     Rails.cache.fetch("current_account_id", expires_in: 24.hours) do
-      iam_data = Net::HTTP.get( URI.parse( METADATA_ENDPOINT + 'iam/info' ) )
+      iam_data = Net::HTTP.get(URI.parse(METADATA_ENDPOINT + 'iam/info'))
       return JSON.parse(iam_data)["InstanceProfileArn"].split(":")[4]
     end
   end
@@ -16,7 +42,7 @@ module AwsCommon
     return [] if !ENV['MOCK_DATA'].blank?
     Rails.cache.fetch("account_ids", expires_in: 1.hours) do
       iam = Aws::IAM::Client.new(region: 'eu-west-1')
-      iam_data = Net::HTTP.get( URI.parse( METADATA_ENDPOINT + 'iam/info' ) )
+      iam_data = Net::HTTP.get(URI.parse(METADATA_ENDPOINT + 'iam/info'))
       role_name = JSON.parse(iam_data)["InstanceProfileArn"].split("/")[-1]
       pages_policies = iam.list_role_policies({role_name: role_name})
       account_ids = [[get_current_account_id,""]]
@@ -67,17 +93,41 @@ module AwsCommon
       account_ids.each do |account_id|
         regions.keep_if {|key, value| value }.keys.each do |region|
           if account_id[0] == current_account_id
-            ec2 = Aws::EC2::Resource.new(client: Aws::EC2::Client.new(region: region))
+            ec2 = Aws::EC2::Resource.new(
+              client: Aws::EC2::Client.new(region: region)
+            )
           else
-            role_credentials = Aws::AssumeRoleCredentials.new( client: Aws::STS::Client.new(region: region), role_arn: account_id[1], role_session_name: "reserved_instances" )
-            ec2 = Aws::EC2::Resource.new(client: Aws::EC2::Client.new(region: region, credentials: role_credentials))
+            role_credentials = Aws::AssumeRoleCredentials.new(
+              client: Aws::STS::Client.new(region: region),
+              role_arn: account_id[1],
+              role_session_name: "reserved_instances"
+            )
+            ec2 = Aws::EC2::Resource.new(
+              client: Aws::EC2::Client.new(
+                region: region,
+                credentials: role_credentials
+              )
+            )
           end
           ec2.instances.each do |instance|
             if !is_marketplace(instance.product_codes)
               platform = instance.platform.blank? ? "Linux/UNIX" : "Windows"
-              platform = PLATFORMS[amis[instance.image_id]] if !amis[instance.image_id].nil? && !PLATFORMS[amis[instance.image_id]].nil?
 
-              instances[instance.id] = {type: instance.instance_type, az: instance.placement.availability_zone, tenancy: instance.placement.tenancy, platform: platform, account_id: account_id[0], vpc: instance.vpc_id.blank? ? "EC2 Classic" : "VPC", ami: instance.image_id} if instance.state.name == 'running' and instance.instance_lifecycle != 'spot'
+              if !amis[instance.image_id].nil? && !PLATFORMS[amis[instance.image_id]].nil?
+                platform = PLATFORMS[amis[instance.image_id]]
+              end
+
+              if instance.state.name == 'running' and instance.instance_lifecycle != 'spot'
+                instances[instance.id] = {
+                  type: instance.instance_type,
+                  az: instance.placement.availability_zone,
+                  tenancy: instance.placement.tenancy,
+                  platform: platform,
+                  account_id: account_id[0],
+                  vpc: instance.vpc_id.blank? ? "EC2 Classic" : "VPC",
+                  ami: instance.image_id
+                }
+              end
             end
           end
         end
@@ -97,10 +147,18 @@ module AwsCommon
           if account_id[0] == current_account_id
             ec2 = Aws::EC2::Client.new(region: region)
           else
-            role_credentials = Aws::AssumeRoleCredentials.new( client: Aws::STS::Client.new(region: region), role_arn: account_id[1], role_session_name: "reserved_instances" )
+            role_credentials = Aws::AssumeRoleCredentials.new(
+              client: Aws::STS::Client.new(region: region),
+              role_arn: account_id[1],
+              role_session_name: "reserved_instances"
+            )
             ec2 = Aws::EC2::Client.new(region: region, credentials: role_credentials)
           end
-          modifications = ec2.describe_reserved_instances_modifications({filters: [ {name: 'status', values: ['failed'] } ] })
+          modifications = ec2.describe_reserved_instances_modifications(
+            {
+              filters: [{name: 'status', values: ['failed']}]
+            }
+          )
           modifications.reserved_instances_modifications.each do |modification|
             failed_modifications << modification.reserved_instances_ids[0].reserved_instances_id
           end
@@ -119,9 +177,21 @@ module AwsCommon
     end
     CSV.foreach('/tmp/instances.csv', headers: true) do |row|
       platform = row[5].blank? ? "Linux/UNIX" : "Windows"
-      platform = PLATFORMS[amis[row[9]]] if !amis[row[9]].nil? && !PLATFORMS[amis[row[9]]].nil?
+      if !amis[row[9]].nil? && !PLATFORMS[amis[row[9]]].nil?
+        platform = PLATFORMS[amis[row[9]]]
+      end
 
-      instances[row[1]] = {type: row[2], az: row[3], tenancy: row[4], platform: platform, account_id: row[6], vpc: row[7].blank? ? "EC2 Classic" : "VPC", ami: row[9]} if row[8] == 'running'
+      if row[8] == 'running'
+        instances[row[1]] = {
+          type: row[2],
+          az: row[3],
+          tenancy: row[4],
+          platform: platform,
+          account_id: row[6],
+          vpc: row[7].blank? ? "EC2 Classic" : "VPC",
+          ami: row[9]
+        }
+      end
     end
     return instances
   end
@@ -139,14 +209,20 @@ module AwsCommon
           if account_id[0] == current_account_id
             ec2 = Aws::EC2::Client.new(region: region)
           else
-            role_credentials = Aws::AssumeRoleCredentials.new( client: Aws::STS::Client.new(region: region), role_arn: account_id[1], role_session_name: "reserved_instances" )
+            role_credentials = Aws::AssumeRoleCredentials.new(
+              client: Aws::STS::Client.new(region: region),
+              role_arn: account_id[1],
+              role_session_name: "reserved_instances"
+            )
             ec2 = Aws::EC2::Client.new(region: region, credentials: role_credentials)
           end
           if supported_platforms[account_id[0]].nil?
             platforms = ec2.describe_account_attributes(attribute_names: ["supported-platforms"])
             platforms.each do |platform|
               platform.account_attributes.each do |attribute|
-                supported_platforms[account_id[0]] = attribute.attribute_values.size > 1 ? "Classic" : "VPC" if attribute.attribute_name == 'supported-platforms'
+                if attribute.attribute_name == 'supported-platforms'
+                  supported_platforms[account_id[0]] = attribute.attribute_values.size > 1 ? "Classic" : "VPC"
+                end
               end
             end
           end
@@ -155,7 +231,17 @@ module AwsCommon
           reserved_instances.each do |reserved_instance|
             reserved_instance.reserved_instances.each do |ri|
               if ri.state == 'active'
-                instances[ri.reserved_instances_id] = {type: ri.instance_type, az: ri.availability_zone, tenancy: ri.instance_tenancy, account_id: account_id[0], count: ri.instance_count, description: ri.product_description, role_arn: account_id[1], end: ri.end, status: 'active'} 
+                instances[ri.reserved_instances_id] = {
+                  type: ri.instance_type,
+                  az: ri.availability_zone,
+                  tenancy: ri.instance_tenancy,
+                  account_id: account_id[0],
+                  count: ri.instance_count,
+                  description: ri.product_description,
+                  role_arn: account_id[1],
+                  end: ri.end,
+                  status: 'active'
+                }
                 if supported_platforms[account_id[0]] == 'Classic'
                   instances[ri.reserved_instances_id][:vpc] = ri.product_description.include?("Amazon VPC") ? 'VPC' : 'EC2 Classic'
                 else
@@ -165,7 +251,11 @@ module AwsCommon
               end
             end
           end
-          modifications = ec2.describe_reserved_instances_modifications({filters: [ {name: 'status', values: ['processing'] } ] })
+
+          modifications = ec2.describe_reserved_instances_modifications({
+              filters: [{name: 'status', values: ['processing']}]
+            })
+
           modifications.reserved_instances_modifications.each do |modification|
             if !instances[modification.reserved_instances_ids[0].reserved_instances_id].nil?
               instances[modification.reserved_instances_ids[0].reserved_instances_id][:status] = 'processing'
@@ -187,14 +277,25 @@ module AwsCommon
     end
     CSV.foreach('/tmp/ri.csv', headers: true) do |row|
       if row[8] == 'active'
-        instances[row[1]] = {type: row[2], az: row[3], tenancy: row[4], account_id: row[5], count: row[6].to_i, description: row[7], role_arn: '', status: 'active', end: 2.months.from_now} 
+        instances[row[1]] = {
+          type: row[2],
+          az: row[3],
+          tenancy: row[4],
+          account_id: row[5],
+          count: row[6].to_i,
+          description: row[7],
+          role_arn: '',
+          status: 'active',
+          end: 2.months.from_now
+        }
+
         if platforms[row[5]] == 'Classic'
           instances[row[1]][:vpc] = row[7].include?("Amazon VPC") ? 'VPC' : 'EC2 Classic'
         else
           instances[row[1]][:vpc] = 'VPC'
         end
 
-        instances[row[1]][:platform] = row[7].sub(' (Amazon VPC)','')
+        instances[row[1]][:platform] = row[7].sub(' (Amazon VPC)', '')
       end
     end
     return instances
@@ -206,16 +307,20 @@ module AwsCommon
       if ri[:account_id] == get_current_account_id
         ec2 = Aws::EC2::Client.new(region: region)
       else
-        role_credentials = Aws::AssumeRoleCredentials.new( client: Aws::STS::Client.new(region: region), role_arn: ri[:role_arn], role_session_name: "reserved_instances" )
+        role_credentials = Aws::AssumeRoleCredentials.new(
+          client: Aws::STS::Client.new(region: region),
+          role_arn: ri[:role_arn],
+          role_session_name: "reserved_instances"
+        )
         ec2 = Aws::EC2::Client.new(region: region, credentials: role_credentials)
       end
     end
 
     conf = {}
-    conf[:availability_zone] = recommendation[:az].nil? ? ri[:az] : recommendation[:az] 
+    conf[:availability_zone] = recommendation[:az].nil? ? ri[:az] : recommendation[:az]
     conf[:platform] = recommendation[:vpc].nil? ? (ri[:vpc] == 'VPC' ? 'EC2-VPC' : 'EC2-Classic') : (recommendation[:vpc] == 'VPC' ? 'EC2-VPC' : 'EC2-Classic')
-    conf[:instance_count] = recommendation[:count] 
-    conf[:instance_type] = recommendation[:type].nil? ? ri[:type] : recommendation[:type] 
+    conf[:instance_count] = recommendation[:count]
+    conf[:instance_type] = recommendation[:type].nil? ? ri[:type] : recommendation[:type]
     all_confs = [conf]
 
     if ri[:count]*get_factor(ri[:type]) > conf[:instance_count]*get_factor(conf[:instance_type]) 
@@ -226,7 +331,7 @@ module AwsCommon
       rest_conf[:instance_type] = ri[:type]
       all_confs << rest_conf
     end
-    
+
     ec2.modify_reserved_instances(reserved_instances_ids:[recommendation[:rid]], target_configurations: all_confs) if ENV['MOCK_DATA'].blank?
     log = Recommendation.new
     log.accountid = ri[:account_id]
@@ -267,7 +372,7 @@ module AwsCommon
         end
       end
     end
-    
+
     return last_object
   end
 
@@ -304,8 +409,15 @@ module AwsCommon
         if account_id[0] == current_account_id
           ec2 = Aws::EC2::Resource.new(client: Aws::EC2::Client.new(region: region))
         else
-          role_credentials = Aws::AssumeRoleCredentials.new( client: Aws::STS::Client.new(region: region), role_arn: account_id[1], role_session_name: "reserved_instances" )
-          ec2 = Aws::EC2::Resource.new(client: Aws::EC2::Client.new(region: region, credentials: role_credentials))
+          role_credentials = Aws::AssumeRoleCredentials.new(
+            client: Aws::STS::Client.new(region: region),
+            role_arn: account_id[1],
+            role_session_name: "reserved_instances")
+          ec2 = Aws::EC2::Resource.new(
+            client: Aws::EC2::Client.new(
+              region: region,
+              credentials: role_credentials)
+          )
         end
         ec2.instances({instance_ids: [instance_id]}).each do |instance|
           amis[instance.image_id] = values[0]
@@ -325,34 +437,6 @@ module AwsCommon
       end
     end
     return amis
-  end
-
-  def get_factor(type)
-    size = type.split(".")[1]
-    return case size
-      when "nano"
-        0.25
-      when "micro"
-        0.5
-      when "small"
-        1
-      when "medium"
-        2
-      when "large"
-        4
-      when "xlarge"
-        8
-      when "2xlarge"
-        16
-      when "4xlarge"
-        32
-      when "8xlarge"
-        64
-      when "10xlarge"
-        80
-      else
-        0
-    end
   end
 
 end
