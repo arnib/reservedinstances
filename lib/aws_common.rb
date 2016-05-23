@@ -323,12 +323,17 @@ module AwsCommon
     conf[:instance_type] = recommendation[:type].nil? ? ri[:type] : recommendation[:type]
     all_confs = [conf]
 
-    if ri[:count]*get_factor(ri[:type]) > conf[:instance_count]*get_factor(conf[:instance_type]) 
+    ri_units_before = ri[:count] * get_factor(ri[:type])
+    ri_units_taken = conf[:instance_count] * get_factor(conf[:instance_type])
+
+    if ri_units_before > ri_units_taken
       rest_conf = {}
       rest_conf[:availability_zone] = ri[:az]
       rest_conf[:platform] = ri[:vpc] == 'VPC' ? 'EC2-VPC' : 'EC2-Classic'
-      rest_conf[:instance_count] = ri[:count] - conf[:count]*get_factor(conf[:instance_type])
       rest_conf[:instance_type] = ri[:type]
+
+      # Calculate how many instances will be left in the RI after modifying
+      rest_conf[:instance_count] = (ri_units_before - ri_units_taken) / get_factor(ri[:type])
       all_confs << rest_conf
     end
 
